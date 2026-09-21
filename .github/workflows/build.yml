@@ -1,30 +1,75 @@
-name: C++ Windows Build with ImGui
+name: Build Windows
 
-on: [push, workflow_dispatch]
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
 
 jobs:
   build:
     runs-on: windows-latest
+
     steps:
-    - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    - name: Setup MSVC
-      uses: ilammy/msvc-dev-cmd@v1
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
 
-    - name: Download ImGui Headers
-      run: |
-        curl -L -o imgui.h https://githubusercontent.com
-        curl -L -o imgui_internal.h https://githubusercontent.com
-        curl -L -o imstb_rectpack.h https://githubusercontent.com
-        curl -L -o imstb_textedit.h https://githubusercontent.com
-        curl -L -o imstb_truetype.h https://githubusercontent.com
-      shell: bash
+      - name: Verify ImGui files
+        shell: powershell
+        run: |
+          $files = @(
+            "imgui.h",
+            "imgui.cpp",
+            "imgui_draw.cpp",
+            "imgui_tables.cpp",
+            "imgui_widgets.cpp",
+            "imgui_impl_dx11.cpp",
+            "imgui_impl_dx11.h",
+            "imgui_impl_win32.cpp",
+            "imgui_impl_win32.h",
+            "main.cpp"
+          )
 
-    - name: Compile Code
-      run: cl.exe /O2 /EHsc *.cpp /Fe:program.exe
+          foreach ($file in $files) {
+            if (!(Test-Path $file)) {
+              Write-Error "Missing file: $file"
+              exit 1
+            }
+            Write-Host "Found: $file"
+          }
 
-    - name: Upload EXE
-      uses: actions/upload-artifact@v4
-      with:
-        name: windows-executable
-        path: program.exe
+      - name: Build
+        shell: cmd
+        run: |
+          if not exist build mkdir build
+
+          cl.exe /nologo /std:c++17 /EHsc /O2 ^
+            /I. ^
+            main.cpp ^
+            imgui.cpp ^
+            imgui_draw.cpp ^
+            imgui_tables.cpp ^
+            imgui_widgets.cpp ^
+            imgui_impl_dx11.cpp ^
+            imgui_impl_win32.cpp ^
+            /link ^
+            /OUT:build\app.exe ^
+            /SUBSYSTEM:WINDOWS ^
+            d3d11.lib ^
+            dxgi.lib ^
+            user32.lib ^
+            gdi32.lib ^
+            shell32.lib ^
+            ole32.lib
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-build
+          path: build/app.exe
