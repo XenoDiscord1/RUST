@@ -107,6 +107,13 @@ struct ESPSettings {
     float fov           = 60.f;
 };
 
+// Процесс в списке выбора
+struct ProcInfo {
+    DWORD       pid = 0;
+    std::string name;
+    bool        hasGameAssembly = false;   // подсветка настоящего Rust
+};
+
 struct SharedState {
     std::mutex          mtx;
     std::vector<Entity> entities;
@@ -115,7 +122,21 @@ struct SharedState {
 
     HANDLE              procHandle   = nullptr;
     DWORD               procPid      = 0;
+    std::string         procName;
     uintptr_t           gameBase     = 0;
+
+    // выбор процесса в UI
+    std::mutex               procMtx;
+    std::vector<ProcInfo>    procList;      // снимок запущенных процессов
+    std::atomic<DWORD>       selectedPid  = 0;
+    std::atomic<bool>        listing      = false;
+
+    // счётчик чтений памяти (через CPU) — reads/sec
+    std::atomic<uint64_t> memReadTotal = 0;   // всего успешных чтений
+    std::atomic<uint64_t> memReadFail  = 0;   // всего ошибок чтения
+    std::atomic<uint64_t> memBytes     = 0;   // всего прочитано байт
+    std::atomic<double>   memReadRate  = 0.0;  // чтений/сек (обновляется раз в сек)
+    std::atomic<double>   memMBs       = 0.0;  // МБ/сек
 
     std::atomic<bool>   attached     = false;
     std::atomic<bool>   scanning     = false;
@@ -139,7 +160,13 @@ struct SharedState {
 template<typename T>
 T Rpm(uintptr_t addr) {
     T v{};
-    ReadProcessMemory(G.procHandle,reinterpret_cast<LPCVOID>(addr),&v,sizeof(T),nullptr);
+    SIZE_T br = 0;
+    if (ReadProcessMemory(G.procHandle,reinterpret_cast<LPCVOID>(addr),&v,sizeof(T),&br) && br==sizeof(T)) {
+        G.memReadTotal.fetch_add(1,std::memory_order_relaxed);
+        G.memBytes.fetch_add(br,std::memory_order_relaxed);
+    } else {
+        G.memReadFail.fetch_add(1,std::memory_order_relaxed);
+    }
     return v;
 }
 
@@ -185,6 +212,55 @@ uintptr_t FindModule(DWORD pid,const char* mod) {
     } while(Module32Next(snap,&me));
     CloseHandle(snap);
     return r;
+}
+
+// Проверка: есть ли в процессе GameAssembly.dll (настоящий Rust)
+bool HasModule(DWORD pid,const char* mod) {
+    HANDLE snap=CreateToolhelp32Snapshot(TH32CS_SNAPMODULE|TH32CS_SNAPMODULE32,pid);
+    if(snap==INVALID_HANDLE_VALUE) return false;
+    MODULEENTRY32 me{sizeof(me)};
+    bool found=false;
+    if(Module32First(snap,&me)) do {
+        if(_stricmp(me.szModule,mod)==0){found=true;break;}
+    } while(Module32Next(snap,&me));
+    CloseHandle(snap);
+    return found;
+}
+
+// Снимок запущенных процессов для выбора в UI.
+// Rust-кандидаты (RustClient.exe/rust.exe или с GameAssembly.dll) идут наверх.
+void RefreshProcessList() {
+    G.listing=true;
+    std::vector<ProcInfo> list;
+    HANDLE snap=CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS,0);
+    if(snap!=INVALID_HANDLE_VALUE){
+        PROCESSENTRY32 pe{sizeof(pe)};
+        if(Process32First(snap,&pe)) do {
+            if(pe.th32ProcessID<=4) continue;              // System / Idle
+            ProcInfo pi;
+            pi.pid  = pe.th32ProcessID;
+            pi.name = pe.szExeFile;
+            bool likelyRust = _stricmp(pi.name.c_str(),"RustClient.exe")==0
+                           || _stricmp(pi.name.c_str(),"rust.exe")==0;
+            // модульный чек дорогой — делаем только для вероятных кандидатов
+            if(likelyRust) pi.hasGameAssembly = HasModule(pi.pid,"GameAssembly.dll");
+            list.push_back(std::move(pi));
+        } while(Process32Next(snap,&pe));
+        CloseHandle(snap);
+    }
+    // Rust наверх, затем по имени
+    std::sort(list.begin(),list.end(),[](const ProcInfo&a,const ProcInfo&b){
+        int ra = a.hasGameAssembly?2 : (_stricmp(a.name.c_str(),"RustClient.exe")==0||_stricmp(a.name.c_str(),"rust.exe")==0?1:0);
+        int rb = b.hasGameAssembly?2 : (_stricmp(b.name.c_str(),"RustClient.exe")==0||_stricmp(b.name.c_str(),"rust.exe")==0?1:0);
+        if(ra!=rb) return ra>rb;
+        return _stricmp(a.name.c_str(),b.name.c_str())<0;
+    });
+    {
+        std::lock_guard<std::mutex> lk(G.procMtx);
+        G.procList=std::move(list);
+    }
+    G.listing=false;
+    G.Log("Process list refreshed ("+std::to_string(G.procList.size())+" processes)");
 }
 
 // ═══════════════════════════════════════════════════════
@@ -314,6 +390,8 @@ void RefreshCamera() {
 }
 
 void GameThread() {
+    uint64_t lastReads = 0, lastBytes = 0;
+    DWORD    lastTick  = GetTickCount();
     while(G.running) {
         if(!G.attached){Sleep(500);continue;}
         RefreshCamera();
@@ -321,28 +399,84 @@ void GameThread() {
             std::lock_guard<std::mutex> lk(G.mtx);
             for(auto&e:G.entities) RefreshEntity(e);
         }
+        // раз в ~1 сек считаем скорость чтения памяти через CPU
+        DWORD now=GetTickCount();
+        DWORD dt =now-lastTick;
+        if(dt>=1000){
+            uint64_t r=G.memReadTotal.load(), b=G.memBytes.load();
+            double secs=dt/1000.0;
+            G.memReadRate = (r-lastReads)/secs;
+            G.memMBs      = ((b-lastBytes)/secs)/(1024.0*1024.0);
+            lastReads=r; lastBytes=b; lastTick=now;
+        }
         Sleep(16);
     }
 }
 
+// Имя процесса по PID (для лога/статуса)
+std::string NameOfPid(DWORD pid) {
+    std::lock_guard<std::mutex> lk(G.procMtx);
+    for(auto&p:G.procList) if(p.pid==pid) return p.name;
+    return "PID "+std::to_string(pid);
+}
+
+// Подключение к КОНКРЕТНОМУ pid, выбранному в UI.
+bool AttachToPid(DWORD pid) {
+    if(!pid){ G.Log("No process selected"); return false; }
+    HANDLE h=OpenProcess(PROCESS_ALL_ACCESS,FALSE,pid);
+    if(!h){
+        G.Log("OpenProcess failed for PID "+std::to_string(pid)+" (run as Administrator?)");
+        return false;
+    }
+    // предыдущий хэндл закрываем
+    if(G.procHandle){ CloseHandle(G.procHandle); G.procHandle=nullptr; }
+
+    G.procHandle = h;
+    G.procPid    = pid;
+    G.procName   = NameOfPid(pid);
+    G.gameBase   = FindModule(pid,"GameAssembly.dll");
+
+    // сброс счётчиков чтения памяти
+    G.memReadTotal=0; G.memReadFail=0; G.memBytes=0;
+    G.memReadRate=0.0; G.memMBs=0.0;
+
+    G.attached=true;
+    G.Log("Attached: "+G.procName+" PID="+std::to_string(pid));
+    if(!G.gameBase) G.Log("WARN: GameAssembly.dll not found — camera offsets won't resolve");
+    else G.Log("GameBase: "+[&]{std::ostringstream o;o<<std::hex<<G.gameBase;return o.str();}());
+    ScanEntities();
+    return true;
+}
+
 void AttachThread() {
+    // 1) если пользователь выбрал процесс в списке — берём его
+    DWORD sel=G.selectedPid.load();
+    if(sel){ AttachToPid(sel); return; }
+
+    // 2) иначе авто-поиск как раньше
     const char* procs[]={"RustClient.exe","rust.exe",nullptr};
-    G.Log("Searching for Rust process...");
+    G.Log("Auto-searching for Rust process...");
     for(int i=0;procs[i];++i){
         DWORD pid=FindPID(procs[i]);
         if(!pid) continue;
-        HANDLE h=OpenProcess(PROCESS_ALL_ACCESS,FALSE,pid);
-        if(!h) continue;
-        G.procHandle=h;
-        G.procPid=pid;
-        G.gameBase=FindModule(pid,"GameAssembly.dll");
-        G.attached=true;
-        G.Log("Attached: "+std::string(procs[i])+" PID="+std::to_string(pid));
-        G.Log("GameBase: "+[&]{std::ostringstream o;o<<std::hex<<G.gameBase;return o.str();}());
-        ScanEntities();
+        G.selectedPid=pid;
+        AttachToPid(pid);
         return;
     }
-    G.Log("Rust not found");
+    G.Log("Rust not found — pick a process manually in the list");
+}
+
+// Полная отвязка от процесса
+void DetachProcess() {
+    G.attached=false;
+    Sleep(20); // дать GameThread выйти из чтений
+    {
+        std::lock_guard<std::mutex> lk(G.mtx);
+        G.entities.clear();
+    }
+    if(G.procHandle){ CloseHandle(G.procHandle); G.procHandle=nullptr; }
+    G.procPid=0; G.gameBase=0; G.procName.clear();
+    G.Log("Detached");
 }
 
 // ═══════════════════════════════════════════════════════
@@ -549,26 +683,98 @@ void RenderGUI() {
     ImGui::PopStyleColor();
     ImGui::Separator(); ImGui::Spacing();
 
+    // ── Верхний блок: статус + счётчик чтения памяти ──
     if(!G.attached) {
         ImGui::TextColored({1,.4f,0,1},"● NOT ATTACHED");
-        if(ImGui::Button("ATTACH TO RUST",{200,30}))
-            std::thread(AttachThread).detach();
     } else if(G.scanning) {
         ImGui::TextColored({1,.8f,0,1},"● SCANNING...  %.0f%%",G.scanPct.load());
         ImGui::ProgressBar(G.scanPct/100.f,{-1,5});
     } else {
         int pc=(int)std::count_if(G.entities.begin(),G.entities.end(),
             [](const Entity&e){return !e.lost&&e.type==EType::Player;});
-        char sb[128];
-        snprintf(sb,128,"● PID=%u  BASE=%llX  PLAYERS=%d",G.procPid,G.gameBase,pc);
-        ImGui::TextColored({0,1,.4f,1},"%s",sb);
-        if(ImGui::Button("RE-SCAN",{110,24}))
-            std::thread([](){ScanEntities();}).detach();
+        ImGui::TextColored({0,1,.4f,1},"● %s  PID=%u  BASE=%llX  PLAYERS=%d",
+            G.procName.c_str(),G.procPid,G.gameBase,pc);
+    }
+
+    // Счётчик чтений памяти через CPU (reads/sec + МБ/сек)
+    if(G.attached){
+        double rate=G.memReadRate.load(), mbs=G.memMBs.load();
+        ImGui::TextColored({.5f,.8f,1,1},
+            "MEM READ: %.0f reads/s   %.2f MB/s   |  total %llu  fails %llu",
+            rate, mbs,
+            (unsigned long long)G.memReadTotal.load(),
+            (unsigned long long)G.memReadFail.load());
+        // мини-бар нагрузки чтения (0..5000 reads/s)
+        ImGui::ProgressBar((float)(rate>5000.0?1.0:rate/5000.0),{-1,4},"");
     }
 
     ImGui::Spacing();
 
     if(ImGui::BeginTabBar("##tabs")) {
+
+        // ── PROCESS: выбор процесса раста прямо в приложении ──
+        if(ImGui::BeginTabItem("Process")) {
+            if(ImGui::Button("REFRESH LIST",{130,26}))
+                std::thread([](){RefreshProcessList();}).detach();
+            ImGui::SameLine();
+            if(G.listing) ImGui::TextColored({1,.8f,0,1},"scanning...");
+            else          ImGui::TextDisabled("green = Rust (GameAssembly.dll)");
+
+            ImGui::Spacing();
+            DWORD sel=G.selectedPid.load();
+
+            if(ImGui::BeginTable("proc",3,
+                ImGuiTableFlags_Borders|ImGuiTableFlags_RowBg|
+                ImGuiTableFlags_ScrollY|ImGuiTableFlags_Resizable,{0,320})){
+                ImGui::TableSetupColumn("PID",  ImGuiTableColumnFlags_WidthFixed,70);
+                ImGui::TableSetupColumn("Process",ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableSetupColumn("Rust?", ImGuiTableColumnFlags_WidthFixed,60);
+                ImGui::TableHeadersRow();
+                std::lock_guard<std::mutex> lk(G.procMtx);
+                for(auto&p:G.procList){
+                    ImGui::TableNextRow();
+                    bool isSel=(p.pid==sel);
+                    ImGui::TableSetColumnIndex(0);
+                    char idbuf[32]; snprintf(idbuf,sizeof(idbuf),"%u",p.pid);
+                    if(ImGui::Selectable(idbuf,isSel,ImGuiSelectableFlags_SpanAllColumns))
+                        G.selectedPid=p.pid;
+                    ImGui::TableSetColumnIndex(1);
+                    if(p.hasGameAssembly) ImGui::TextColored({0,1,.4f,1},"%s",p.name.c_str());
+                    else                  ImGui::TextUnformatted(p.name.c_str());
+                    ImGui::TableSetColumnIndex(2);
+                    if(p.hasGameAssembly) ImGui::TextColored({0,1,.4f,1},"YES");
+                    else                  ImGui::TextDisabled("-");
+                }
+                ImGui::EndTable();
+            }
+
+            ImGui::Spacing();
+            sel=G.selectedPid.load();
+            if(sel) ImGui::Text("Selected PID: %u",sel);
+            else    ImGui::TextDisabled("No process selected");
+
+            bool busy=G.scanning.load();
+            if(busy) ImGui::BeginDisabled();
+            if(ImGui::Button(G.attached?"RE-ATTACH TO SELECTED":"ATTACH TO SELECTED",{220,30})){
+                std::thread([](){ AttachThread(); }).detach();
+            }
+            if(busy) ImGui::EndDisabled();
+
+            ImGui::SameLine();
+            if(ImGui::Button("AUTO-FIND RUST",{150,30})){
+                G.selectedPid=0; // сброс — AttachThread уйдёт в авто-поиск
+                std::thread([](){ AttachThread(); }).detach();
+            }
+
+            if(G.attached){
+                ImGui::SameLine();
+                if(ImGui::Button("DETACH",{90,30}))
+                    std::thread([](){ DetachProcess(); }).detach();
+                if(ImGui::Button("RE-SCAN ENTITIES",{170,24}))
+                    std::thread([](){ScanEntities();}).detach();
+            }
+            ImGui::EndTabItem();
+        }
 
         if(ImGui::BeginTabItem("ESP")) {
             ImGui::Columns(2,"c",false);
@@ -652,10 +858,12 @@ void RenderGUI() {
         }
 
         if(ImGui::BeginTabItem("Help")) {
-            ImGui::BulletText("F1  — toggle Players");
-            ImGui::BulletText("F2  — toggle NPC");
-            ImGui::BulletText("F3  — toggle Loot");
-            ImGui::BulletText("F4  — toggle Containers");
+            ImGui::BulletText("Process tab — pick the Rust process, then ATTACH TO SELECTED");
+            ImGui::BulletText("Green row = real Rust (GameAssembly.dll found)");
+            ImGui::BulletText("AUTO-FIND RUST — attaches automatically if running");
+            ImGui::BulletText("MEM READ meter — memory reads/sec through the CPU");
+            ImGui::BulletText("F1 — toggle Players    F2 — toggle NPC");
+            ImGui::BulletText("F3 — toggle Loot       F4 — toggle Containers");
             ImGui::BulletText("ESC — close ESP overlay");
             ImGui::BulletText("Run as Administrator");
             ImGui::EndTabItem();
@@ -823,6 +1031,8 @@ int WINAPI WinMain(HINSTANCE hInst,HINSTANCE,LPSTR,int){
     std::thread(GameThread).detach();
 
     G.Log("RustAdmin started");
+    // Заполнить список процессов сразу, чтобы вкладка Process была готова
+    std::thread([](){ RefreshProcessList(); }).detach();
 
     MSG msg{};
     while(G.running) {
