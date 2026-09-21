@@ -1,4 +1,4 @@
-name: C++ Windows Build
+name: C++ Windows Build with ImGui
 
 on: [push, workflow_dispatch]
 
@@ -10,6 +10,15 @@ jobs:
 
     - name: Setup MSVC
       uses: ilammy/msvc-dev-cmd@v1
+
+    - name: Download ImGui Headers
+      run: |
+        curl -L -o imgui.h https://githubusercontent.com
+        curl -L -o imgui_internal.h https://githubusercontent.com
+        curl -L -o imstb_rectpack.h https://githubusercontent.com
+        curl -L -o imstb_textedit.h https://githubusercontent.com
+        curl -L -o imstb_truetype.h https://githubusercontent.com
+      shell: bash
 
     - name: Compile Code
       run: cl.exe /O2 /EHsc *.cpp /Fe:program.exe
