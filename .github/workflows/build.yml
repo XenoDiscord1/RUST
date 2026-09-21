@@ -1,0 +1,21 @@
+name: C++ Windows Build
+
+on: [push, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup MSVC
+      uses: ilammy/msvc-dev-cmd@v1
+
+    - name: Compile Code
+      run: cl.exe /O2 /EHsc *.cpp /Fe:program.exe
+
+    - name: Upload EXE
+      uses: actions/upload-artifact@v4
+      with:
+        name: windows-executable
+        path: program.exe
